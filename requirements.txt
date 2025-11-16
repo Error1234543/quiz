@@ -1,4 +1,4 @@
 pyTelegramBotAPI
 PyPDF2
 Pillow
-requests
+requests 
