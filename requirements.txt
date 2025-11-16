@@ -1,4 +1,4 @@
 pyTelegramBotAPI
-pdfplumber
-pillow
+PyPDF2
+Pillow
 requests
