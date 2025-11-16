@@ -1,6 +1,4 @@
-pyTelegramBotAPI==4.22.1
-PyMuPDF==1.23.8
+pyTelegramBotAPI
+pdfplumber
 pillow
-pytesseract
 requests
-sqlite3-binary
