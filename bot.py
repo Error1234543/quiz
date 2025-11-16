@@ -1,306 +1,306 @@
-#!/usr/bin/env python3
-# main.py - Telegram MCQ→Quiz Bot (Render Compatible / No OCR)
-
-import os, re, io, time, json, threading, sqlite3
-from datetime import datetime
-from typing import List, Dict, Tuple, Optional
-
+import os
 import telebot
-from telebot import types
-
-# PDF extract libs (safe for Render)
-from PyPDF2 import PdfReader
-from PIL import Image
+import fitz   # PyMuPDF for PDF text extraction
 import requests
+from flask import Flask, request
+from datetime import datetime
+import threading
 
-# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required.")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", 10000))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0")) or None
-FORWARD_BACKUP_CHANNEL_ID = int(os.getenv("FORWARD_BACKUP_CHANNEL_ID", "0")) or None
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
+app = Flask(__name__)
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+# ---------------------- MEMORY ----------------------
+user_sessions = {}   # stores questions, answers, results, timer etc.
 
-# ---------------- DATABASE ----------------
-DB_PATH = "quizbot.db"
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cur = conn.cursor()
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS sessions (
-  chat_id INTEGER,
-  session_id TEXT,
-  questions_json TEXT,
-  current_q INTEGER,
-  scores_json TEXT,
-  start_ts INTEGER,
-  end_ts INTEGER,
-  PRIMARY KEY (chat_id, session_id)
-)
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS polls_map (
-  chat_id INTEGER,
-  poll_id TEXT,
-  session_id TEXT,
-  q_index INTEGER
-)
-""")
-
-conn.commit()
-
-# ---------------- PDF → TEXT ----------------
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """ Pure PyPDF2 extraction (OCR removed for Render compatibility). """
-    pages = []
+# ---------------------- GEMINI OCR ----------------------
+def gemini_extract_text(image_bytes):
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key=" + GEMINI_API_KEY
+    data = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": "Extract all text clearly from this image"},
+                    {"inline_data": {"mime_type": "image/png", "data": image_bytes}}
+                ]
+            }
+        ]
+    }
+    r = requests.post(url, json=data)
+    result = r.json()
     try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-    except Exception:
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except:
         return ""
 
-    for page in reader.pages:
-        try:
-            txt = page.extract_text() or ""
-        except:
-            txt = ""
-        pages.append(txt.strip())
 
-    return "\n\n".join(pages)
+# ---------------------- GEMINI ANSWER FINDER ----------------------
+def gemini_answer(question, options):
+    prompt = f"""
+MCQ QUESTION:
+{question}
 
-# ---------------- MCQ PARSER ----------------
-OPTION_REGEX = re.compile(
-    r'(?:\n|\r|^)\s*([A-Da-d1-4])[\).\-\s:]{1,3}\s*(.+?)(?=(?:\n\s*[A-Da-d1-4][\).\-\s:])|$)', re.S)
+OPTIONS:
+A) {options.get('A')}
+B) {options.get('B')}
+C) {options.get('C')}
+D) {options.get('D')}
 
-def parse_mcqs_from_text(text: str) -> List[Dict]:
-    items = []
-    if not text.strip():
-        return items
+Return only correct option letter (A/B/C/D).
+"""
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + GEMINI_API_KEY
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    r = requests.post(url, json=data)
+    try:
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        for ch in ["A", "B", "C", "D"]:
+            if ch in text:
+                return ch
+    except:
+        pass
+    return "A"
 
-    parts = re.split(r'\n(?=\s*\d{1,3}[\.\)\-]\s)', text)
 
-    for part in parts:
-        m = re.match(r'\s*(\d{1,3})[\.\)\-]\s*(.+)', part, re.S)
-        if not m:
+# ---------------------- PARSE MCQ OPTION-B FORMAT ----------------------
+def parse_mcqs(text):
+    lines = text.split("\n")
+    questions = []
+    q = ""
+    opts = {}
+
+    for line in lines:
+        line = line.strip()
+
+        if line == "":
             continue
 
-        num = int(m.group(1))
-        rest = m.group(2).strip()
-        opts = OPTION_REGEX.findall("\n" + rest)
+        if line[0].isdigit() and ")" in line:
+            if q != "":
+                questions.append({"question": q, "options": opts})
+            q = line
+            opts = {}
 
-        options = [o[1].strip().replace("\n", " ") for o in opts]
+        elif line.startswith("(A)") or line.startswith("A)"):
+            opts["A"] = line.split(")", 1)[1].strip()
 
-        qtext = rest
-        if opts:
-            first_opt = re.search(r'(?:\n|\r)\s*[A-Da-d1-4][\).\-\s:]{1,3}', rest)
-            if first_opt:
-                qtext = rest[:first_opt.start()].strip()
+        elif line.startswith("(B)") or line.startswith("B)"):
+            opts["B"] = line.split(")", 1)[1].strip()
 
-        if options:
-            items.append({
-                "num": num,
-                "question": qtext,
-                "options": options,
-                "correct_index": None,
-                "explanation": None
-            })
+        elif line.startswith("(C)") or line.startswith("C)"):
+            opts["C"] = line.split(")", 1)[1].strip()
 
-    return items
+        elif line.startswith("(D)") or line.startswith("D)"):
+            opts["D"] = line.split(")", 1)[1].strip()
 
-# ---------------- AI (optional) ----------------
-def get_answer_with_gemini(question: str, options: List[str]):
-    if not GEMINI_API_KEY:
-        return 0, "(Default: A)"
-    return 0, "(Gemini logic not yet added)"
+    if q != "":
+        questions.append({"question": q, "options": opts})
 
-# ---------------- DB HELPERS ----------------
-def save_session(chat_id, sid, questions, current_q=0, scores=None, start_ts=0, end_ts=0):
-    cur.execute("""REPLACE INTO sessions 
-    (chat_id, session_id, questions_json, current_q, scores_json, start_ts, end_ts)
-    VALUES (?,?,?,?,?,?,?)""",
-        (chat_id, sid, json.dumps(questions), current_q,
-         json.dumps(scores or {}), start_ts, end_ts))
-    conn.commit()
+    return questions
 
-def load_session(chat_id, sid):
-    cur.execute("SELECT * FROM sessions WHERE chat_id=? AND session_id=?", (chat_id, sid))
-    r = cur.fetchone()
-    if not r:
-        return None
-    return {
-        "chat_id": r[0],
-        "session_id": r[1],
-        "questions": json.loads(r[2]),
-        "current_q": r[3],
-        "scores": json.loads(r[4]),
-        "start_ts": r[5],
-        "end_ts": r[6],
+
+# ---------------------- PDF HANDLER ----------------------
+@bot.message_handler(content_types=['document'])
+def pdf_handler(message):
+    chat_id = message.chat.id
+
+    file_id = message.document.file_id
+    file = bot.get_file(file_id)
+    pdf_bytes = bot.download_file(file.file_path)
+
+    # SAVE TEMP PDF
+    with open("temp.pdf", "wb") as f:
+        f.write(pdf_bytes)
+
+    bot.reply_to(message, "⏳ Extracting text from PDF... Wait 5–10 seconds")
+
+    extracted_text = ""
+
+    doc = fitz.open("temp.pdf")
+    for page in doc:
+        extracted_text += page.get_text()
+
+    mcqs = parse_mcqs(extracted_text)
+
+    if len(mcqs) == 0:
+        bot.send_message(chat_id, "❌ No MCQs found. Make sure PDF is Option-B format.")
+        return
+
+    # STORE SESSION
+    user_sessions[chat_id] = {
+        "mcqs": mcqs,
+        "answers": {},
+        "correct_ans": {},
+        "start_time": None,
+        "end_time": None
     }
 
-def map_poll(chat_id, poll_id, sid, q_index):
-    cur.execute("INSERT INTO polls_map VALUES (?,?,?,?)", (chat_id, poll_id, sid, q_index))
-    conn.commit()
+    # ASK TIME
+    markup = telebot.types.InlineKeyboardMarkup()
+    for t in ["5", "10", "30", "60", "90"]:
+        markup.add(telebot.types.InlineKeyboardButton(f"{t} min", callback_data=f"time_{t}"))
 
-def lookup_poll(poll_id):
-    cur.execute("SELECT chat_id, session_id, q_index FROM polls_map WHERE poll_id=?", (poll_id,))
-    r = cur.fetchone()
-    return {"chat_id": r[0], "session_id": r[1], "q_index": r[2]} if r else None
+    bot.send_message(chat_id, "⏳ Select Quiz Time:", reply_markup=markup)
 
-# ---------------- POLL ANSWERS ----------------
-@bot.poll_answer_handler(func=lambda a: True)
-def on_poll_answer(ans):
-    ref = lookup_poll(ans.poll_id)
-    if not ref:
+
+# ---------------------- TIME SELECT ----------------------
+@bot.callback_query_handler(func=lambda call: call.data.startswith("time_"))
+def time_set(call):
+    chat_id = call.message.chat.id
+    minutes = int(call.data.split("_")[1])
+
+    bot.edit_message_text(f"⏳ Quiz Time Set: {minutes} min\nQuiz starting...", chat_id, call.message.message_id)
+
+    session = user_sessions.get(chat_id)
+    session["start_time"] = datetime.now()
+
+    # GENERATE AI ANSWERS FIRST
+    bot.send_message(chat_id, "🤖 Finding answers using Gemini AI...")
+
+    for i, q in enumerate(session["mcqs"]):
+        ca = gemini_answer(q["question"], q["options"])
+        session["correct_ans"][i] = ca
+
+    bot.send_message(chat_id, "🔥 All answers ready! Sending full quiz...")
+
+    # SEND ALL QUESTIONS
+    for i, q in enumerate(session["mcqs"]):
+        text = f"**Q{i+1}.** {q['question']}\n\n"
+        text += f"A) {q['options']['A']}\n"
+        text += f"B) {q['options']['B']}\n"
+        text += f"C) {q['options']['C']}\n"
+        text += f"D) {q['options']['D']}\n"
+
+        markup = telebot.types.InlineKeyboardMarkup()
+        for opt in ["A", "B", "C", "D"]:
+            markup.add(telebot.types.InlineKeyboardButton(opt, callback_data=f"ans_{i}_{opt}"))
+
+        bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
+
+    # START TIMER THREAD
+    threading.Thread(target=quiz_timer, args=(chat_id, minutes)).start()
+
+
+# ---------------------- USER ANSWERS ----------------------
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ans_"))
+def handle_answer(call):
+    chat_id = call.message.chat.id
+    _, qnum, opt = call.data.split("_")
+    qnum = int(qnum)
+
+    user_sessions[chat_id]["answers"][qnum] = opt
+
+    bot.answer_callback_query(call.id, f"Selected {opt}")
+
+
+# ---------------------- TIMER END ----------------------
+def quiz_timer(chat_id, minutes):
+    import time
+    time.sleep(minutes * 60)
+
+    show_result(chat_id)
+
+
+# ---------------------- RESULT FUNCTION ----------------------
+def show_result(chat_id):
+    session = user_sessions.get(chat_id)
+    if not session:
         return
 
-    sess = load_session(ref["chat_id"], ref["session_id"])
-    if not sess:
+    session["end_time"] = datetime.now()
+
+    correct = 0
+    wrong = 0
+
+    for i in range(len(session["mcqs"])):
+        user_ans = session["answers"].get(i)
+        real_ans = session["correct_ans"].get(i)
+
+        if user_ans == real_ans:
+            correct += 1
+        else:
+            wrong += 1
+
+    total = len(session["mcqs"])
+    taken = (session["end_time"] - session["start_time"]).seconds // 60
+
+    result_msg = f"""
+🎉 **QUIZ COMPLETED!**  
+-------------------------
+📊 **Result Summary**
+Total Questions: {total}
+✅ Correct: {correct}
+❌ Wrong: {wrong}
+⏱️ Time Taken: {taken} min
+Accuracy: {round((correct/total)*100)}%
+"""
+
+    bot.send_message(chat_id, result_msg, parse_mode='Markdown')
+
+
+# ---------------------- /solve COMMAND ----------------------
+@bot.message_handler(commands=['solve'])
+def solve_q(message):
+    chat_id = message.chat.id
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        bot.reply_to(message, "Use: /solve 5")
         return
 
-    uid = str(ans.user.id)
-    chosen = ans.option_ids[0] if ans.option_ids else None
+    num = int(parts[1]) - 1
 
-    scores = sess["scores"]
-    if uid not in scores:
-        scores[uid] = {"correct": 0, "wrong": 0, "answers": {}}
-
-    correct_idx = sess["questions"][ref["q_index"]]["correct_index"]
-
-    if chosen == correct_idx:
-        scores[uid]["correct"] += 1
-    else:
-        scores[uid]["wrong"] += 1
-
-    scores[uid]["answers"][str(ref["q_index"])] = chosen
-
-    save_session(ref["chat_id"], ref["session_id"],
-                 sess["questions"], sess["current_q"],
-                 scores, sess["start_ts"], sess["end_ts"])
-
-# ---------------- QUIZ END ----------------
-def end_quiz(sid, chat_id):
-    sess = load_session(chat_id, sid)
-    if not sess:
+    session = user_sessions.get(chat_id)
+    if not session:
+        bot.reply_to(message, "❌ No active quiz.")
         return
 
-    scores = sess["scores"]
-    results = []
+    q = session["mcqs"][num]
+    prompt = f"""
+Explain this MCQ in detail with correct answer.
 
-    for uid, s in scores.items():
-        msg = f"✅ {s['correct']} | ❌ {s['wrong']} | 📝 {s['correct'] + s['wrong']}"
+Question:
+{q['question']}
 
-        try:
-            bot.send_message(int(uid), f"Your Quiz Result:\n{msg}")
-        except:
-            pass
+Options:
+A) {q['options']['A']}
+B) {q['options']['B']}
+C) {q['options']['C']}
+D) {q['options']['D']}
+"""
 
-        results.append(f"<a href='tg://user?id={uid}'>User</a>: {msg}")
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + GEMINI_API_KEY
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    r = requests.post(url, json=data)
 
-    summary = "📢 Quiz Ended!\n\n" + "\n".join(results) if results else "Quiz ended! No answers."
-    bot.send_message(chat_id, summary, parse_mode="HTML")
+    explanation = r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
-# ---------------- COMMANDS ----------------
-@bot.message_handler(commands=["start", "help"])
-def start_msg(m):
-    bot.send_message(m.chat.id, "Send /quiz and upload your MCQ PDF!")
+    bot.send_message(chat_id, explanation)
 
-@bot.message_handler(commands=["quiz"])
-def quiz_cmd(m):
-    bot.send_message(m.chat.id, "📄 Send your MCQ PDF now.")
 
-@bot.message_handler(content_types=["document"])
-def on_doc(m):
-    doc = m.document
+# ---------------------- FLASK WEBHOOK ----------------------
+@app.route("/", methods=["POST"])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
+        bot.process_new_updates([update])
+        return "OK"
+    return "NOT JSON"
 
-    if not doc.file_name.lower().endswith(".pdf"):
-        bot.reply_to(m, "❌ Only PDF allowed.")
-        return
 
-    file_info = bot.get_file(doc.file_id)
-    pdf_bytes = bot.download_file(file_info.file_path)
+@app.route("/", methods=["GET"])
+def hello():
+    return "Bot Running"
 
-    bot.reply_to(m, "📥 Extracting MCQs...")
 
-    # extract text
-    text = extract_text_from_pdf_bytes(pdf_bytes)
-    mcqs = parse_mcqs_from_text(text)
+# ---------------------- SET WEBHOOK ----------------------
+bot.remove_webhook()
+bot.set_webhook(url=WEBHOOK_URL)
 
-    if not mcqs:
-        bot.send_message(m.chat.id, "❌ No MCQs found.")
-        return
-
-    sid = f"session_{int(time.time())}"
-
-    for q in mcqs:
-        idx, exp = get_answer_with_gemini(q["question"], q["options"])
-        q["correct_index"] = idx
-        q["explanation"] = exp
-
-    save_session(m.chat.id, sid, mcqs)
-
-    kb = types.InlineKeyboardMarkup()
-    for t in [5, 10, 15, 20, 30, 45, 60]:
-        kb.add(types.InlineKeyboardButton(f"{t} min", callback_data=f"dur:{sid}:{t}"))
-
-    bot.send_message(m.chat.id, f"Found {len(mcqs)} MCQs.\nSelect duration:", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("dur:"))
-def on_duration(c):
-    _, sid, mins = c.data.split(":")
-    mins = int(mins)
-
-    sess = load_session(c.message.chat.id, sid)
-
-    start = int(time.time())
-    end = start + mins * 60
-
-    save_session(c.message.chat.id, sid, sess["questions"], 0, {}, start, end)
-
-    bot.answer_callback_query(c.id, f"Starting {mins}-minute quiz!")
-
-    # send all polls at once
-    for i, q in enumerate(sess["questions"]):
-        try:
-            poll = bot.send_poll(
-                c.message.chat.id,
-                q["question"],
-                q["options"],
-                is_anonymous=False
-            )
-            map_poll(c.message.chat.id, poll.poll.id, sid, i)
-        except:
-            bot.send_message(c.message.chat.id, f"Q{i+1}: {q['question']}")
-        time.sleep(0.4)
-
-    threading.Timer(mins * 60, lambda: end_quiz(sid, c.message.chat.id)).start()
-
-@bot.message_handler(commands=["result"])
-def on_result(m):
-    cur.execute(
-        "SELECT session_id FROM sessions WHERE chat_id=? ORDER BY rowid DESC LIMIT 1",
-        (m.chat.id,)
-    )
-    r = cur.fetchone()
-
-    if not r:
-        return bot.reply_to(m, "No quiz found.")
-
-    sess = load_session(m.chat.id, r[0])
-    scores = sess["scores"].get(str(m.from_user.id))
-
-    if not scores:
-        bot.reply_to(m, "You have no answers.")
-        return
-
-    bot.send_message(
-        m.chat.id,
-        f"✅ {scores['correct']} correct | ❌ {scores['wrong']} wrong"
-    )
-
-# ---------------- START BOT ----------------
+# ---------------------- RUN FLASK APP ----------------------
 if __name__ == "__main__":
-    print("Bot running successfully on Render!")
-    bot.infinity_polling(timeout=120, long_polling_timeout=90)
+    app.run(host="0.0.0.0", port=PORT)
