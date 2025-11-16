@@ -6,6 +6,7 @@ from flask import Flask, request
 from datetime import datetime
 import threading
 
+# ---------------------- ENV VARIABLES ----------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -112,14 +113,12 @@ def pdf_handler(message):
     file = bot.get_file(file_id)
     pdf_bytes = bot.download_file(file.file_path)
 
-    # SAVE TEMP PDF
     with open("temp.pdf", "wb") as f:
         f.write(pdf_bytes)
 
     bot.reply_to(message, "⏳ Extracting text from PDF... Wait 5–10 seconds")
 
     extracted_text = ""
-
     doc = fitz.open("temp.pdf")
     for page in doc:
         extracted_text += page.get_text()
@@ -130,7 +129,6 @@ def pdf_handler(message):
         bot.send_message(chat_id, "❌ No MCQs found. Make sure PDF is Option-B format.")
         return
 
-    # STORE SESSION
     user_sessions[chat_id] = {
         "mcqs": mcqs,
         "answers": {},
@@ -139,7 +137,6 @@ def pdf_handler(message):
         "end_time": None
     }
 
-    # ASK TIME
     markup = telebot.types.InlineKeyboardMarkup()
     for t in ["5", "10", "30", "60", "90"]:
         markup.add(telebot.types.InlineKeyboardButton(f"{t} min", callback_data=f"time_{t}"))
@@ -158,7 +155,6 @@ def time_set(call):
     session = user_sessions.get(chat_id)
     session["start_time"] = datetime.now()
 
-    # GENERATE AI ANSWERS FIRST
     bot.send_message(chat_id, "🤖 Finding answers using Gemini AI...")
 
     for i, q in enumerate(session["mcqs"]):
@@ -167,7 +163,6 @@ def time_set(call):
 
     bot.send_message(chat_id, "🔥 All answers ready! Sending full quiz...")
 
-    # SEND ALL QUESTIONS
     for i, q in enumerate(session["mcqs"]):
         text = f"**Q{i+1}.** {q['question']}\n\n"
         text += f"A) {q['options']['A']}\n"
@@ -181,7 +176,6 @@ def time_set(call):
 
         bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
 
-    # START TIMER THREAD
     threading.Thread(target=quiz_timer, args=(chat_id, minutes)).start()
 
 
@@ -201,7 +195,6 @@ def handle_answer(call):
 def quiz_timer(chat_id, minutes):
     import time
     time.sleep(minutes * 60)
-
     show_result(chat_id)
 
 
@@ -282,24 +275,23 @@ D) {q['options']['D']}
     bot.send_message(chat_id, explanation)
 
 
-# ---------------------- FLASK WEBHOOK ----------------------
-@app.route("/", methods=["POST"])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-        bot.process_new_updates([update])
-        return "OK"
-    return "NOT JSON"
+# ---------------------- FLASK WEBHOOK (Render Compatible) ----------------------
+@app.route("/webhook/" + BOT_TOKEN, methods=["POST"])
+def tg_webhook():
+    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
+    bot.process_new_updates([update])
+    return "OK"
 
 
 @app.route("/", methods=["GET"])
-def hello():
-    return "Bot Running"
+def home():
+    return "Bot Running Successfully!"
 
 
 # ---------------------- SET WEBHOOK ----------------------
 bot.remove_webhook()
 bot.set_webhook(url=WEBHOOK_URL)
+
 
 # ---------------------- RUN FLASK APP ----------------------
 if __name__ == "__main__":
