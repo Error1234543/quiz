@@ -2,5 +2,7 @@ pyTelegramBotAPI==4.29.1
 Flask==3.0.3
 PyPDF2==3.0.1
 Pillow==10.4.0
+pytesseract==0.3.10
+pdf2image==1.17.0
 requests==2.32.3
 PyMuPDF==1.24.9
